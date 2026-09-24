@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+VERSION="1.0.1"
+NAME="Linux Backup Manager"
+AUTHOR="Designed & Developed by antonios.mortos@outlook.com"
+ETC="${LBM_ETC:-/etc/linux-backup-manager}"
+PROFILES="$ETC/profiles"
+SECRETS="$ETC/secrets"
+STATE="${LBM_STATE:-/var/lib/linux-backup-manager}"
+HISTORY="$STATE/history"
+LOGDIR="${LBM_LOGDIR:-/var/log/linux-backup-manager}"
+CACHEDIR="${LBM_CACHEDIR:-/var/cache/linux-backup-manager}"
+LOCKDIR="${LBM_LOCKDIR:-/run/lock/linux-backup-manager}"
+
+R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; BLU=$'\033[34m'; CYN=$'\033[36m'
+
+init_dirs(){ mkdir -p "$PROFILES" "$SECRETS" "$STATE" "$HISTORY" "$LOGDIR" "$CACHEDIR" "$LOCKDIR"; chmod 700 "$SECRETS" 2>/dev/null || true; }
+ts(){ date '+%Y-%m-%d %H:%M:%S'; }
+iso(){ date -Is; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Run this action with sudo." >&2; return 1; }; }
+log(){ init_dirs; printf '%s [%s] %s\n' "$(ts)" "$1" "$2" >> "$LOGDIR/lbm.log"; }
+info(){ printf '%s[INFO]%s %s\n' "$CYN" "$R" "$*" >&2; log INFO "$*"; }
+ok(){ printf '%s[ OK ]%s %s\n' "$GRN" "$R" "$*" >&2; log OK "$*"; }
+warn(){ printf '%s[WARN]%s %s\n' "$YLW" "$R" "$*" >&2; log WARN "$*"; }
+fail(){ printf '%s[FAIL]%s %s\n' "$RED" "$R" "$*" >&2; log FAIL "$*"; }
+valid_name(){ [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
+profile_path(){ printf '%s/%s.conf' "$PROFILES" "$1"; }
+history_path(){ printf '%s/%s.tsv' "$HISTORY" "$1"; }
+
+getv(){ local f; f="$(profile_path "$1")"; [[ -f "$f" ]] || return 1; awk -F= -v k="$2" '$1==k{sub(/^[^=]*=/,"");print;exit}' "$f"; }
+profiles(){ init_dirs; find "$PROFILES" -maxdepth 1 -type f -name '*.conf' -printf '%f\n' 2>/dev/null | sed 's/\.conf$//' | sort; }
+last_history(){ local f; f="$(history_path "$1")"; [[ -s "$f" ]] && tail -n1 "$f"; }
+add_history(){ printf '%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" >> "$(history_path "$1")"; }
+
+banner(){ clear; printf '%s%s' "$B" "$CYN"; cat <<'TXT'
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         LINUX BACKUP MANAGER                                ║
+║             Backup • Restore • Verify • Retention • DR                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+TXT
+printf '%s' "$R"; }
+footer(){ printf '\n%s%s%s\n' "$D" "$AUTHOR" "$R"; }
+pause(){ printf '\nPress ENTER to continue...'; read -r _; }
+
+dlg(){ dialog --backtitle "$NAME v$VERSION  |  $AUTHOR" "$@"; }
+has_dialog(){ have dialog && [[ -t 0 ]] && [[ -t 2 ]]; }
+input(){ local title="$1" prompt="$2" def="${3:-}"; if has_dialog; then dlg --stdout --title "$title" --inputbox "$prompt" 12 78 "$def"; else printf '%s [%s]: ' "$prompt" "$def" >&2; local x; read -r x; printf '%s' "${x:-$def}"; fi; }
+yesno(){ if has_dialog; then dlg --title "$1" --yesno "$2" 13 80; else printf '%s [y/N]: ' "$2"; local x; read -r x; [[ "$x" =~ ^[Yy]$ ]]; fi; }
+msg(){ if has_dialog; then dlg --title "$1" --msgbox "$2" 18 84; else banner; printf '%s%s%s\n\n%s\n' "$B" "$1" "$R" "$2"; footer; pause; fi; }
+textbox(){ if has_dialog; then dlg --title "$1" --textbox "$2" 30 112; else less -R "$2"; fi; }
+
+select_profile(){ local arr=() p menu=() row st eng target; while IFS= read -r p; do [[ -n "$p" ]] && arr+=("$p"); done < <(profiles); ((${#arr[@]})) || return 1; if has_dialog; then for p in "${arr[@]}"; do row="$(last_history "$p" || true)"; st="$(awk -F'\t' '{print $3}' <<<"$row")"; [[ -z "$st" ]] && st=NEVER; eng="$(getv "$p" ENGINE || true)"; target="$(getv "$p" TARGET || true)"; menu+=("$p" "$eng | $st | $target"); done; dlg --stdout --title "Select Backup Profile" --menu "Use ↑/↓ and ENTER" 28 110 18 "${menu[@]}"; else local i=1; for p in "${arr[@]}"; do printf '%2d) %s\n' "$i" "$p"; ((i++)); done; printf 'Select: ' >&2; local n; read -r n; [[ "$n" =~ ^[0-9]+$ ]] || return 1; ((n>=1 && n<=${#arr[@]})) || return 1; printf '%s' "${arr[n-1]}"; fi; }
+
+human(){ awk -v n="${1:-0}" 'BEGIN{split("B KiB MiB GiB TiB",u," ");i=1;while(n>=1024&&i<5){n/=1024;i++}printf "%.1f %s",n,u[i]}' ; }
+validate_profile(){ local p="$1" f src e t; f="$(profile_path "$p")"; [[ -f "$f" ]] || { fail "Profile not found: $p"; return 1; }; src="$(getv "$p" SOURCE)"; e="$(getv "$p" ENGINE)"; t="$(getv "$p" TARGET)"; [[ -e "$src" ]] || { fail "Source not found: $src"; return 1; }; [[ "$e" =~ ^(rsync|restic|tarzst)$ ]] || { fail "Unsupported engine: $e"; return 1; }; [[ -n "$t" ]] || { fail "Target is empty."; return 1; }; }
+
+inventory(){ local out="$1"; { echo "captured_at=$(iso)"; echo "hostname=$(hostname -f 2>/dev/null || hostname)"; echo "kernel=$(uname -srmo)"; [[ -r /etc/os-release ]] && . /etc/os-release && echo "os=${PRETTY_NAME:-unknown}"; echo; echo '[ip]'; ip -brief addr 2>/dev/null || true; echo; echo '[routes]'; ip route 2>/dev/null || true; echo; echo '[mounts]'; findmnt -rn 2>/dev/null || true; echo; echo '[listening]'; ss -lntup 2>/dev/null || true; echo; echo '[services]'; systemctl list-unit-files --type=service --state=enabled --no-pager 2>/dev/null || true; echo; echo '[packages]'; have dpkg-query && dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null || true; have rpm && rpm -qa 2>/dev/null || true; } > "$out"; }
+
+stage_app(){ local p="$1" d="$2" a; a="$(getv "$p" APP_TYPE || true)"; mkdir -p "$d"; case "$a" in ''|none) ;; mysql|mariadb) have mysqldump && { info "Capturing MySQL/MariaDB dump"; mysqldump --all-databases --single-transaction --routines --events > "$d/mysql-all.sql"; } || warn "mysqldump unavailable";; postgresql) have pg_dumpall && { info "Capturing PostgreSQL dump"; sudo -u postgres pg_dumpall > "$d/postgresql-all.sql"; } || warn "pg_dumpall unavailable";; docker) have docker && { info "Capturing Docker inventory"; docker ps -a --no-trunc > "$d/docker-ps.txt" 2>&1 || true; docker images --digests --no-trunc > "$d/docker-images.txt" 2>&1 || true; docker network ls > "$d/docker-networks.txt" 2>&1 || true; docker volume ls > "$d/docker-volumes.txt" 2>&1 || true; docker info > "$d/docker-info.txt" 2>&1 || true; } || warn "docker unavailable";; esac; }
+
+create_profile(){ need_root || return; init_dirs; local p src e t a d w m sched ver man f pw; p="$(input "Create Profile" "Profile name" "server01")" || return; valid_name "$p" || { msg "Invalid Name" "Use letters, numbers, dot, dash and underscore only."; return; }; [[ ! -f "$(profile_path "$p")" ]] || { msg "Exists" "Profile already exists."; return; }; src="$(input "Source" "Source path" "/etc")" || return; [[ -e "$src" ]] || { msg "Source Not Found" "$src does not exist."; return; }; if has_dialog; then e="$(dlg --stdout --title "Backup Engine" --radiolist "Choose engine" 17 84 6 rsync "Incremental transparent snapshots" on restic "Encrypted deduplicated repository" off tarzst "tar + zstd compressed archives" off)" || return; else e="$(input "Engine" "rsync/restic/tarzst" "rsync")"; fi; case "$e" in rsync|tarzst) t="$(input "Destination" "Local backup destination" "/backup/$p")";; restic) t="$(input "Restic Repository" "Repository (/path, sftp:user@host:/repo, s3:...)" "/backup/restic-$p")";; *) return;; esac; if has_dialog; then a="$(dlg --stdout --title "Application Awareness" --radiolist "Optional pre-backup application capture" 17 82 8 none "Filesystem only" on mysql "MySQL/MariaDB dump" off postgresql "PostgreSQL dump" off docker "Docker inventory" off)" || return; else a="$(input "App Type" "none/mysql/postgresql/docker" "none")"; fi; d="$(input "Retention" "Keep daily" "14")"; w="$(input "Retention" "Keep weekly (Restic)" "8")"; m="$(input "Retention" "Keep monthly (Restic)" "12")"; sched="$(input "Schedule" "systemd OnCalendar" "*-*-* 02:00:00")"; ver=yes; yesno "Verification" "Verify after every backup?" || ver=no; man=no; yesno "SHA-256" "Generate SHA-256 manifest for rsync/tar backups?\nThis is stronger but slower." && man=yes; f="$(profile_path "$p")"; cat > "$f" <<EOF2
+NAME=$p
+SOURCE=$src
+ENGINE=$e
+TARGET=$t
+APP_TYPE=$a
+KEEP_DAILY=$d
+KEEP_WEEKLY=$w
+KEEP_MONTHLY=$m
+VERIFY_AFTER=$ver
+SHA256_MANIFEST=$man
+SCHEDULE=$sched
+EXCLUDES=
+PRE_HOOK=
+POST_HOOK=
+RESTIC_PASSWORD_FILE=$SECRETS/$p.restic
+CREATED_AT=$(iso)
+EOF2
+chmod 600 "$f"; if [[ "$e" == restic ]]; then if has_dialog; then pw="$(dlg --stdout --insecure --passwordbox "Set Restic repository password" 11 70)" || return; else read -r -s -p 'Restic password: ' pw; echo; fi; [[ -n "$pw" ]] || { msg "Password Required" "Restic requires a password."; return; }; printf '%s\n' "$pw" > "$SECRETS/$p.restic"; chmod 600 "$SECRETS/$p.restic"; fi; msg "Profile Created" "Profile: $p\nEngine: $e\nSource: $src\nTarget: $t\nSchedule: $sched"; }
+
+restic_env(){ export RESTIC_REPOSITORY="$(getv "$1" TARGET)"; export RESTIC_PASSWORD_FILE="$(getv "$1" RESTIC_PASSWORD_FILE)"; }
+restic_ready(){ have restic || { fail "restic is not installed"; return 1; }; restic_env "$1"; restic snapshots >/dev/null 2>&1 || { warn "Initializing Restic repository"; restic init; }; }
+
+run_rsync(){ local p="$1" id="$2" stage="$3" src tgt snap latest man; src="$(getv "$p" SOURCE)"; tgt="$(getv "$p" TARGET)"; have rsync || { fail "rsync is not installed"; return 1; }; snap="$tgt/snapshots/$id"; latest="$tgt/snapshots/latest"; mkdir -p "$snap/data"; local args=(-aHAX --numeric-ids --delete-delay --info=stats2,progress2); [[ -L "$latest" && -d "$latest" ]] && args+=(--link-dest="$latest"); info "Creating rsync snapshot $snap"; rsync "${args[@]}" "$src"/ "$snap/data"/; mkdir -p "$snap/lbm-metadata"; rsync -a "$stage"/ "$snap/lbm-metadata"/ 2>/dev/null || true; inventory "$snap/lbm-system-inventory.txt"; printf 'profile=%s\nrun_id=%s\ncreated=%s\nsource=%s\n' "$p" "$id" "$(iso)" "$src" > "$snap/lbm-snapshot.meta"; man="$(getv "$p" SHA256_MANIFEST || true)"; if [[ "$man" == yes ]]; then info "Generating SHA-256 manifest"; (cd "$snap/data" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$snap/SHA256SUMS"; fi; ln -sfn "$snap" "$latest"; du -sb "$snap" 2>/dev/null | awk '{print $1}'; }
+run_tarzst(){ local p="$1" id="$2" stage="$3" src tgt ar; src="$(getv "$p" SOURCE)"; tgt="$(getv "$p" TARGET)"; have zstd || { fail "zstd is not installed"; return 1; }; mkdir -p "$tgt/archives"; ar="$tgt/archives/${p}-${id}.tar.zst"; info "Creating $ar"; tar --xattrs --acls --numeric-owner -C "$(dirname "$src")" -cf - "$(basename "$src")" | zstd -T0 -6 -q -o "$ar"; tar -C "$stage" -cf - . | zstd -T0 -6 -q -o "$tgt/archives/${p}-${id}.metadata.tar.zst"; inventory "$tgt/archives/${p}-${id}.inventory.txt"; [[ "$(getv "$p" SHA256_MANIFEST || true)" == yes ]] && sha256sum "$ar" > "$ar.sha256"; stat -c '%s' "$ar"; }
+run_restic(){ local p="$1" stage="$3" src; src="$(getv "$p" SOURCE)"; restic_ready "$p" || return 1; info "Running encrypted deduplicated Restic backup"; restic backup --tag "lbm:$p" --host "$(hostname -f 2>/dev/null || hostname)" "$src" "$stage"; restic stats --mode raw-data latest 2>/dev/null | awk '/Total Size/{print $3;exit}' || echo 0; }
+
+verify(){ local p="$1" e tgt s ar; validate_profile "$p" || return; e="$(getv "$p" ENGINE)"; case "$e" in rsync) tgt="$(getv "$p" TARGET)"; s="$tgt/snapshots/latest"; [[ -f "$s/lbm-snapshot.meta" ]] || { fail "Snapshot metadata missing"; return 1; }; if [[ -f "$s/SHA256SUMS" ]]; then info "Checking SHA-256 manifest"; (cd "$s/data" && sha256sum -c "$s/SHA256SUMS" --quiet); else warn "No manifest; structural verification only"; find "$s/data" -type f -print -quit >/dev/null; fi;; tarzst) tgt="$(getv "$p" TARGET)"; ar="$(find "$tgt/archives" -type f -name "${p}-*.tar.zst" ! -name '*.metadata.tar.zst' -printf '%p\n' 2>/dev/null | sort -r | head -n1)"; [[ -f "$ar" ]] || { fail "Archive not found"; return 1; }; zstd -tq "$ar"; zstd -dc "$ar" | tar -tf - >/dev/null; [[ -f "$ar.sha256" ]] && sha256sum -c "$ar.sha256" --quiet;; restic) restic_ready "$p" && restic check --read-data-subset=1/20;; esac; ok "Verification passed for $p"; }
+
+retention(){ local p="$1" e tgt keep d w m; e="$(getv "$p" ENGINE)"; case "$e" in rsync) tgt="$(getv "$p" TARGET)"; keep="$(getv "$p" KEEP_DAILY)"; mapfile -t a < <(find "$tgt/snapshots" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r); for ((i=keep;i<${#a[@]};i++)); do info "Pruning ${a[i]}"; rm -rf -- "$tgt/snapshots/${a[i]}"; done;; tarzst) tgt="$(getv "$p" TARGET)"; keep="$(getv "$p" KEEP_DAILY)"; mapfile -t a < <(find "$tgt/archives" -type f -name "${p}-*.tar.zst" ! -name '*.metadata.tar.zst' -printf '%p\n' 2>/dev/null | sort -r); for ((i=keep;i<${#a[@]};i++)); do rm -f -- "${a[i]}" "${a[i]}.sha256"; done;; restic) restic_ready "$p" || return; d="$(getv "$p" KEEP_DAILY)"; w="$(getv "$p" KEEP_WEEKLY)"; m="$(getv "$p" KEEP_MONTHLY)"; restic forget --tag "lbm:$p" --keep-daily "$d" --keep-weekly "$w" --keep-monthly "$m" --prune;; esac; }
+
+run_backup(){ local p="$1" fd start end id stage e bytes=0 rc=0 pre post; need_root || return; validate_profile "$p" || return; exec {fd}>"$LOCKDIR/$p.lock"; flock -n "$fd" || { fail "Profile is already running"; return 1; }; start="$(iso)"; id="$(date '+%Y%m%d-%H%M%S')"; stage="$(mktemp -d "$CACHEDIR/${p}.${id}.XXXX")"; trap 'rm -rf "$stage" 2>/dev/null || true' RETURN; pre="$(getv "$p" PRE_HOOK || true)"; [[ -n "$pre" ]] && { info "Running PRE_HOOK"; bash -lc "$pre" || rc=1; }; ((rc==0)) && stage_app "$p" "$stage/app"; ((rc==0)) && inventory "$stage/system-inventory.txt"; e="$(getv "$p" ENGINE)"; if ((rc==0)); then case "$e" in rsync) bytes="$(run_rsync "$p" "$id" "$stage")" || rc=1;; tarzst) bytes="$(run_tarzst "$p" "$id" "$stage")" || rc=1;; restic) bytes="$(run_restic "$p" "$id" "$stage")" || rc=1;; esac; fi; if ((rc==0)) && [[ "$(getv "$p" VERIFY_AFTER || true)" == yes ]]; then verify "$p" || rc=1; fi; ((rc==0)) && retention "$p" || true; post="$(getv "$p" POST_HOOK || true)"; [[ -n "$post" && $rc -eq 0 ]] && bash -lc "$post" || true; end="$(iso)"; if ((rc==0)); then add_history "$p" "$start" "$end" SUCCESS "$bytes" "run_id=$id"; ok "Backup completed: $p"; else add_history "$p" "$start" "$end" FAILED "$bytes" "run_id=$id"; fail "Backup failed: $p"; fi; return "$rc"; }
+
+points(){ local p="$1" e tgt; e="$(getv "$p" ENGINE)"; tgt="$(getv "$p" TARGET)"; case "$e" in rsync) find "$tgt/snapshots" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r;; tarzst) find "$tgt/archives" -type f -name "${p}-*.tar.zst" ! -name '*.metadata.tar.zst' -printf '%p\n' 2>/dev/null | sort -r;; restic) restic_ready "$p" >/dev/null && restic snapshots --tag "lbm:$p" --compact;; esac; }
+restore(){ local p="$1" point="$2" dest="$3" e tgt src; need_root || return; validate_profile "$p" || return; e="$(getv "$p" ENGINE)"; mkdir -p "$dest"; case "$e" in rsync) tgt="$(getv "$p" TARGET)"; [[ "$point" == latest ]] && src="$tgt/snapshots/latest/data" || src="$tgt/snapshots/$point/data"; [[ -d "$src" ]] || { fail "Recovery point not found"; return 1; }; rsync -aHAX --numeric-ids --info=progress2 "$src"/ "$dest"/;; tarzst) [[ "$point" == latest ]] && point="$(points "$p" | head -n1)"; zstd -dc "$point" | tar --xattrs --acls --numeric-owner -xf - -C "$dest";; restic) restic_ready "$p" || return; restic restore "$point" --target "$dest";; esac; ok "Restore completed to $dest"; }
+
+history_report(){ local p="$1" f; f="$(history_path "$p")"; [[ -s "$f" ]] || { echo "No history."; return; }; printf '%-27s %-27s %-10s %-12s %s\n' START END STATUS BYTES DETAIL; printf '%*s\n' 100 '' | tr ' ' '-'; awk -F'\t' '{printf "%-27s %-27s %-10s %-12s %s\n",$1,$2,$3,$4,$5}' "$f" | tail -n50; }
+storage_report(){ local p="$1" e t; e="$(getv "$p" ENGINE)"; t="$(getv "$p" TARGET)"; echo "Profile: $p"; echo "Engine : $e"; echo "Target : $t"; echo; if [[ "$e" == restic ]]; then restic_env "$p"; restic stats 2>/dev/null || true; elif [[ -e "$t" ]]; then df -h "$t"; echo; du -sh "$t" 2>/dev/null || true; else echo 'Target does not exist yet.'; fi; }
+
+schedule(){ local p="$1" s bin; need_root || return; validate_profile "$p" || return; s="$(getv "$p" SCHEDULE)"; bin="$(command -v lbm 2>/dev/null || readlink -f "$0")"; cat > "/etc/systemd/system/lbm-backup-$p.service" <<EOF2
+[Unit]
+Description=Linux Backup Manager - $p
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=$bin run $p
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+EOF2
+cat > "/etc/systemd/system/lbm-backup-$p.timer" <<EOF2
+[Unit]
+Description=Schedule Linux Backup Manager profile $p
+[Timer]
+OnCalendar=$s
+Persistent=true
+RandomizedDelaySec=300
+Unit=lbm-backup-$p.service
+[Install]
+WantedBy=timers.target
+EOF2
+systemctl daemon-reload; systemctl enable --now "lbm-backup-$p.timer"; ok "Timer enabled: $s"; systemctl list-timers "lbm-backup-$p.timer" --no-pager; }
+
+doctor(){ echo "$NAME - Doctor"; echo "Host: $(hostname -f 2>/dev/null || hostname)"; echo "Version: $VERSION"; echo; local c; for c in dialog rsync zstd restic tar openssl systemctl flock findmnt ip ss; do if have "$c"; then printf '%s[ OK ]%s %-12s %s\n' "$GRN" "$R" "$c" "$(command -v "$c")"; else printf '%s[MISS]%s %-12s\n' "$YLW" "$R" "$c"; fi; done; echo; echo 'Profiles:'; local p; while IFS= read -r p; do [[ -n "$p" ]] && printf '  %-22s engine=%-8s source=%s\n' "$p" "$(getv "$p" ENGINE)" "$(getv "$p" SOURCE)"; done < <(profiles); }
+
+dashboard(){ local os=unknown n failn=0 warnn=0 p row st end lastok=Never; [[ -r /etc/os-release ]] && . /etc/os-release && os="${PRETTY_NAME:-unknown}"; n="$(profiles | wc -l)"; while IFS= read -r p; do [[ -n "$p" ]] || continue; row="$(last_history "$p" || true)"; st="$(awk -F'\t' '{print $3}' <<<"$row")"; end="$(awk -F'\t' '{print $2}' <<<"$row")"; [[ "$st" == FAILED ]] && ((failn++)); [[ "$st" == WARNING ]] && ((warnn++)); [[ "$st" == SUCCESS && "$lastok" == Never ]] && lastok="$end"; done < <(profiles); cat <<EOF2
+Host      : $(hostname -f 2>/dev/null || hostname)
+OS        : $os
+Kernel    : $(uname -r)
+Profiles  : $n
+Failures  : $failn
+Warnings  : $warnn
+Last OK   : $lastok
+EOF2
+}
+
+main_menu(){ if has_dialog; then dlg --stdout --clear --title "$NAME" --menu "$(dashboard)\n\nChoose an action:" 35 112 19 STATUS "Dashboard / backup health" CREATE "Create backup profile" RUN "Run backup now" RESTORE "Restore backup" VERIFY "Verify integrity" HISTORY "Backup history" BROWSE "Browse recovery points" RETENTION "Apply retention" SCHEDULE "Create/update systemd timer" STORAGE "Storage status" INVENTORY "Capture DR inventory" DOCTOR "Diagnostics" LOGS "View logs" EXIT "Exit"; else banner; dashboard; cat <<'TXT'
+
+ 1) Dashboard             8) Apply retention
+ 2) Create profile        9) systemd schedule
+ 3) Run backup           10) Storage status
+ 4) Restore              11) DR inventory
+ 5) Verify               12) Doctor
+ 6) History              13) Logs
+ 7) Recovery points       0) Exit
+TXT
+footer; printf 'Select: ' >&2; local n; read -r n; case "$n" in 1) echo STATUS;;2)echo CREATE;;3)echo RUN;;4)echo RESTORE;;5)echo VERIFY;;6)echo HISTORY;;7)echo BROWSE;;8)echo RETENTION;;9)echo SCHEDULE;;10)echo STORAGE;;11)echo INVENTORY;;12)echo DOCTOR;;13)echo LOGS;;0)echo EXIT;;esac; fi; }
+
+tui(){ while true; do local a p tmp point dest; a="$(main_menu)" || break; case "$a" in STATUS) banner; dashboard; footer; pause;; CREATE) create_profile;; RUN) p="$(select_profile)" || continue; yesno "Run Backup" "Run '$p' now?" || continue; clear; run_backup "$p"; pause;; RESTORE) p="$(select_profile)" || continue; point="$(input "Recovery Point" "Snapshot/archive ID or 'latest'" "latest")"; dest="$(input "Restore Destination" "Restore into directory" "/restore-test/$p")"; yesno "Confirm Restore" "Profile: $p\nPoint: $point\nDestination: $dest\n\nContinue?" || continue; clear; restore "$p" "$point" "$dest"; pause;; VERIFY) p="$(select_profile)" || continue; clear; verify "$p"; pause;; HISTORY) p="$(select_profile)" || continue; tmp="$(mktemp)"; history_report "$p" > "$tmp"; textbox "History - $p" "$tmp"; rm -f "$tmp";; BROWSE) p="$(select_profile)" || continue; tmp="$(mktemp)"; points "$p" > "$tmp" 2>&1; textbox "Recovery Points - $p" "$tmp"; rm -f "$tmp";; RETENTION) p="$(select_profile)" || continue; yesno "Retention" "Apply retention to '$p'? Old recovery points may be deleted." || continue; clear; retention "$p"; pause;; SCHEDULE) p="$(select_profile)" || continue; clear; schedule "$p"; pause;; STORAGE) p="$(select_profile)" || continue; tmp="$(mktemp)"; storage_report "$p" > "$tmp" 2>&1; textbox "Storage - $p" "$tmp"; rm -f "$tmp";; INVENTORY) tmp="$STATE/inventory-$(date +%Y%m%d-%H%M%S).txt"; inventory "$tmp"; msg "DR Inventory" "Saved to:\n$tmp";; DOCTOR) tmp="$(mktemp)"; doctor > "$tmp"; textbox "Doctor" "$tmp"; rm -f "$tmp";; LOGS) touch "$LOGDIR/lbm.log"; textbox "Logs" "$LOGDIR/lbm.log";; EXIT|'') break;; esac; done; clear; }
+
+usage(){ cat <<EOF2
+$NAME v$VERSION
+
+Usage:
+  lbm                         Interactive TUI
+  lbm status                  Dashboard
+  lbm profiles                List profiles
+  lbm create                  Create profile wizard
+  lbm show PROFILE            Show profile
+  lbm run PROFILE             Run backup
+  lbm verify PROFILE          Verify latest backup
+  lbm points PROFILE          List recovery points
+  lbm restore PROFILE POINT DEST
+  lbm history PROFILE         Show run history
+  lbm retention PROFILE       Apply retention
+  lbm schedule PROFILE        Install/update systemd timer
+  lbm storage PROFILE         Storage report
+  lbm inventory [PATH]        Capture DR inventory
+  lbm doctor                  Diagnostics
+  lbm logs                    Follow logs
+  lbm version
+EOF2
+}
+
+init_dirs
+cmd="${1:-tui}"
+case "$cmd" in tui) tui;; status) banner; dashboard; footer;; profiles) profiles;; create) create_profile;; show) [[ $# -ge 2 ]] || { usage; exit 2; }; sed -E 's#^(RESTIC_PASSWORD_FILE)=.*#\1=[protected]#' "$(profile_path "$2")";; run) [[ $# -ge 2 ]] || { usage; exit 2; }; run_backup "$2";; verify) [[ $# -ge 2 ]] || { usage; exit 2; }; verify "$2";; points) [[ $# -ge 2 ]] || { usage; exit 2; }; points "$2";; restore) [[ $# -ge 4 ]] || { usage; exit 2; }; restore "$2" "$3" "$4";; history) [[ $# -ge 2 ]] || { usage; exit 2; }; history_report "$2";; retention) [[ $# -ge 2 ]] || { usage; exit 2; }; retention "$2";; schedule) [[ $# -ge 2 ]] || { usage; exit 2; }; schedule "$2";; storage) [[ $# -ge 2 ]] || { usage; exit 2; }; storage_report "$2";; inventory) out="${2:-$PWD/lbm-inventory-$(date +%Y%m%d-%H%M%S).txt}"; inventory "$out"; echo "$out";; doctor) doctor;; logs) tail -n200 -f "$LOGDIR/lbm.log";; version|-V|--version) echo "$NAME $VERSION";; help|-h|--help) usage;; *) usage; exit 2;; esac
