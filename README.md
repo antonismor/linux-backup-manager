@@ -40,8 +40,8 @@ LBM is intended for administrators who want a practical management layer over pr
 
 ```text
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                         LINUX BACKUP MANAGER                                ║
-║             Backup • Restore • Verify • Retention • DR                     ║
+║                         LINUX BACKUP MANAGER                                 ║
+║             Backup • Restore • Verify • Retention • DR                       ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 Host      : backup01.example.net
