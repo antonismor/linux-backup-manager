@@ -1,0 +1,12 @@
+*.log
+*.tmp
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+secrets/
+*.restic
+*.key
+*.pem
+.env
