@@ -1,0 +1,24 @@
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                  LINUX BACKUP MANAGER                                      │
+│                         Backup • Restore • Verify • Retention • DR                         │
+├────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Host: backup01.example.net    OS: Debian 13    Status: HEALTHY    Profiles: 5              │
+│ Last successful backup: 24 Sep 2026 19:34     Failures: 0        Warnings: 1              │
+│                                                                                            │
+│  > Dashboard / Backup Health                                                              │
+│    Create Backup Profile                                                                  │
+│    Run Backup Now                                                                         │
+│    Restore Backup                                                                         │
+│    Verify Backup Integrity                                                                │
+│    Backup History                                                                         │
+│    Browse Recovery Points                                                                 │
+│    Apply Retention                                                                        │
+│    Schedule / systemd Timers                                                              │
+│    Storage Status                                                                         │
+│    Disaster-Recovery Inventory                                                            │
+│    Doctor / Diagnostics                                                                   │
+│    Logs                                                                                   │
+│                                                                                            │
+├────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Designed & Developed by antonios.mortos@outlook.com                                       │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
